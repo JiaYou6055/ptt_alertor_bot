@@ -33,6 +33,11 @@ db = Database(config.DB_PATH)
 last_ptt_check_time: float = 0.0
 last_article_check_time: float = 0.0
 
+# Telegram hard limit per message is 4096 chars; keep a safety buffer so a
+# large batch of matched articles is split into multiple messages instead of
+# being rejected wholesale with "Message is too long".
+TELEGRAM_MAX_MSG_LEN = 3800
+
 
 def is_admin(chat_id: int) -> bool:
     """Check if chat_id belongs to a Super Admin (specified in .env)."""
@@ -665,6 +670,64 @@ async def text_command_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
 
+def format_article_line(article: Dict[str, Any]) -> str:
+    """Format a single matched article as one compact digest line."""
+    nrec_str = f"[{article['nrec']}]" if article["nrec"] else "[0]"
+    return (
+        f"• *[{article['board']}]* {nrec_str} "
+        f"[{article['title']}]({article['url']}) - `{article['author']}`"
+    )
+
+
+def build_notification_chunks(matched_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Split matched articles into message chunks under Telegram's length limit.
+
+    Returns a list of {"text": str, "articles": [...]} so each chunk can be
+    sent independently and only its own articles marked pushed on success.
+    """
+    if len(matched_list) == 1:
+        article = matched_list[0]
+        nrec_str = f"[{article['nrec']}]" if article["nrec"] else "[0]"
+        if config.COMPACT_NOTIFICATION:
+            text = (
+                f"🚨 *[{article['board']}]* {nrec_str} [{article['title']}]({article['url']})\n"
+                f"👤 `{article['author']}` | 📅 {article['date']}"
+            )
+        else:
+            text = (
+                f"🚨 *【PTT Alert】看板：#{article['board']}*\n\n"
+                f"📌 *標題：* {article['title']}\n"
+                f"👤 *作者：* `{article['author']}`\n"
+                f"🔥 *人氣：* {article['nrec'] if article['nrec'] else '0'}\n"
+                f"📅 *日期：* {article['date']}\n"
+                f"🔗 [點此閱讀文章]({article['url']})"
+            )
+        return [{"text": text, "articles": matched_list}]
+
+    header = f"🚨 *【PTT 訂閱通知】共 {len(matched_list)} 篇新文章：*\n"
+    chunks: List[Dict[str, Any]] = []
+    cur_lines = [header]
+    cur_articles: List[Dict[str, Any]] = []
+    cur_len = len(header)
+
+    for article in matched_list:
+        line = format_article_line(article)
+        # +1 for the joining newline. Flush the current chunk if adding this
+        # line would exceed the safe limit (and the chunk already has content).
+        if cur_articles and cur_len + len(line) + 1 > TELEGRAM_MAX_MSG_LEN:
+            chunks.append({"text": "\n".join(cur_lines), "articles": cur_articles})
+            cur_lines = [header]
+            cur_articles = []
+            cur_len = len(header)
+        cur_lines.append(line)
+        cur_articles.append(article)
+        cur_len += len(line) + 1
+
+    if cur_articles:
+        chunks.append({"text": "\n".join(cur_lines), "articles": cur_articles})
+    return chunks
+
+
 async def check_ptt_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Periodic job to fetch PTT articles and match against keyword/author/push/boo subscriptions."""
     global last_ptt_check_time
@@ -714,52 +777,27 @@ async def check_ptt_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                     # after the message is successfully delivered (see below),
                     # so a failed send does not permanently suppress the alert.
 
-    # Dispatch aggregated messages per user to avoid message spam
+    # Dispatch per user, splitting large batches into multiple messages so a
+    # long digest is never rejected by Telegram's 4096-char limit.
     for cid, matched_list in user_notifications.items():
         if not matched_list:
             continue
 
-        if len(matched_list) == 1:
-            article = matched_list[0]
-            nrec_str = f"[{article['nrec']}]" if article['nrec'] else "[0]"
-            if config.COMPACT_NOTIFICATION:
-                msg = (
-                    f"🚨 *[{article['board']}]* {nrec_str} [{article['title']}]({article['url']})\n"
-                    f"👤 `{article['author']}` | 📅 {article['date']}"
+        for chunk in build_notification_chunks(matched_list):
+            try:
+                await context.bot.send_message(
+                    chat_id=cid,
+                    text=chunk["text"],
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True,
+                    disable_notification=is_night,
                 )
-            else:
-                msg = (
-                    f"🚨 *【PTT Alert】看板：#{article['board']}*\n\n"
-                    f"📌 *標題：* {article['title']}\n"
-                    f"👤 *作者：* `{article['author']}`\n"
-                    f"🔥 *人氣：* {article['nrec'] if article['nrec'] else '0'}\n"
-                    f"📅 *日期：* {article['date']}\n"
-                    f"🔗 [點此閱讀文章]({article['url']})"
-                )
-        else:
-            # Combine multiple articles into a single digest summary message
-            lines = [f"🚨 *【PTT 訂閱通知】包含 {len(matched_list)} 篇新文章：*\n"]
-            for article in matched_list:
-                nrec_str = f"[{article['nrec']}]" if article['nrec'] else "[0]"
-                lines.append(
-                    f"• *[{article['board']}]* {nrec_str} [{article['title']}]({article['url']}) - `{article['author']}`"
-                )
-            msg = "\n".join(lines)
-
-        try:
-            await context.bot.send_message(
-                chat_id=cid,
-                text=msg,
-                parse_mode="Markdown",
-                disable_web_page_preview=False,
-                disable_notification=is_night,
-            )
-            # Mark as pushed only after successful delivery so a failed send
-            # can be retried on the next cycle instead of being lost forever.
-            for article in matched_list:
-                db.mark_article_pushed(article["article_id"], article["board"])
-        except Exception as e:
-            logger.error(f"Failed to send alert to {cid}: {e}")
+                # Mark as pushed only after this chunk is delivered, so a failed
+                # send is retried next cycle instead of being lost forever.
+                for article in chunk["articles"]:
+                    db.mark_article_pushed(article["article_id"], article["board"])
+            except Exception as e:
+                logger.error(f"Failed to send alert to {cid}: {e}")
 
 
 async def check_tracked_articles_job(context: ContextTypes.DEFAULT_TYPE) -> None:

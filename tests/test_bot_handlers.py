@@ -95,5 +95,34 @@ class TestBotHandlers(unittest.TestCase):
         self.assertIn("正在立即抓取", update.message.reply_text.call_args_list[0][0][0])
         self.assertIn("立即抓取完成", update.message.reply_text.call_args_list[1][0][0])
 
+    def _make_article(self, i):
+        return {
+            "article_id": f"M.{i}.A.ABC",
+            "title": "測試文章標題" * 5,  # long-ish title to grow the digest
+            "url": f"https://www.ptt.cc/bbs/stock/M.{i}.A.ABC.html",
+            "author": f"user{i}",
+            "board": "stock",
+            "nrec": "50",
+            "date": "8/08",
+        }
+
+    def test_build_notification_chunks_single(self):
+        arts = [self._make_article(1)]
+        chunks = bot.build_notification_chunks(arts)
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0]["articles"], arts)
+
+    def test_build_notification_chunks_splits_long_batch(self):
+        # 100 articles must be split into multiple chunks, each under the limit,
+        # and every article must appear exactly once across all chunks.
+        arts = [self._make_article(i) for i in range(100)]
+        chunks = bot.build_notification_chunks(arts)
+        self.assertGreater(len(chunks), 1)
+        for c in chunks:
+            self.assertLessEqual(len(c["text"]), bot.TELEGRAM_MAX_MSG_LEN)
+        total = sum(len(c["articles"]) for c in chunks)
+        self.assertEqual(total, 100)
+
+
 if __name__ == "__main__":
     unittest.main()
