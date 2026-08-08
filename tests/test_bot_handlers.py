@@ -1,7 +1,7 @@
 import unittest
 import asyncio
 import os
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from database import Database
 import bot
 import config
@@ -28,7 +28,8 @@ class TestBotHandlers(unittest.TestCase):
 
         context = MagicMock()
 
-        asyncio.run(bot.text_command_handler(update, context))
+        with patch("bot.check_board_exists", new=AsyncMock(return_value=True)):
+            asyncio.run(bot.text_command_handler(update, context))
         update.message.reply_text.assert_called_once()
         self.assertIn("成功新增關鍵字訂閱", update.message.reply_text.call_args[0][0])
 

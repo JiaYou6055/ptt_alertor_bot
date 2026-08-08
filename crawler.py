@@ -262,3 +262,23 @@ def match_subscription(article: Dict[str, Any], subscription: Dict[str, Any]) ->
             return False
 
     return False
+
+
+async def check_board_exists(board: str, client: Optional[httpx.AsyncClient] = None) -> bool:
+    """Verify if a PTT board exists by checking HTTP status of its index page."""
+    if not board:
+        return False
+    url = f"{config.PTT_DOMAIN}/bbs/{board}/index.html"
+    should_close = False
+    if client is None:
+        client = httpx.AsyncClient(timeout=5.0, follow_redirects=True)
+        should_close = True
+    try:
+        response = await client.get(url, headers=HEADERS, cookies=COOKIES)
+        return response.status_code == 200
+    except Exception:
+        return False
+    finally:
+        if should_close:
+            await client.aclose()
+

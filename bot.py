@@ -19,6 +19,7 @@ from crawler import (
     fetch_article_details,
     match_subscription,
     parse_article_id,
+    check_board_exists,
 )
 
 logging.basicConfig(
@@ -444,6 +445,20 @@ async def del_by_id_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text(f"❌ 找不到訂閱 ID `{sub_id}`。")
 
 
+async def validate_boards_exist(update: Update, board_str: str) -> bool:
+    """Helper to check if all boards specified in board_str exist on PTT."""
+    boards = [b.strip() for b in board_str.split(",") if b.strip()]
+    for b in boards:
+        exists = await check_board_exists(b)
+        if not exists:
+            await update.message.reply_text(
+                f"❌ 找不到 PTT 看板「`{b}`」！請檢查名稱拼寫是否正確（例如：gossiping, stock, movie）。",
+                parse_mode="Markdown",
+            )
+            return False
+    return True
+
+
 async def text_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Parse natural language Ptt-Alertor commands sent by user."""
     if not update.message or not update.message.text:
@@ -507,6 +522,8 @@ async def text_command_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     match_add_kw = re.match(r"^新增\s+([^\s]+)\s+(.+)$", text)
     if match_add_kw:
         board_part, target_part = match_add_kw.group(1), match_add_kw.group(2)
+        if not await validate_boards_exist(update, board_part):
+            return
         sub_ids = db.add_subscription(chat_id, "keyword", board_part, target_part)
         await update.message.reply_text(
             f"✅ *成功新增關鍵字訂閱！*\n📌 看板：`{board_part}`\n🔍 關鍵字：`{target_part}`",
@@ -526,6 +543,8 @@ async def text_command_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     match_add_author = re.match(r"^新增作者\s+([^\s]+)\s+(.+)$", text)
     if match_add_author:
         board_part, target_part = match_add_author.group(1), match_add_author.group(2)
+        if not await validate_boards_exist(update, board_part):
+            return
         db.add_subscription(chat_id, "author", board_part, target_part)
         await update.message.reply_text(
             f"✅ *成功新增作者訂閱！*\n📌 看板：`{board_part}`\n👤 作者：`{target_part}`",
@@ -545,6 +564,8 @@ async def text_command_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     match_add_push = re.match(r"^新增推文數\s+([^\s]+)\s+(\d+)$", text)
     if match_add_push:
         board_part, num_part = match_add_push.group(1), match_add_push.group(2)
+        if not await validate_boards_exist(update, board_part):
+            return
         db.add_subscription(chat_id, "push", board_part, num_part)
         await update.message.reply_text(
             f"✅ *成功新增推文數訂閱！*\n📌 看板：`{board_part}`\n🔥 門檻：推文數 ≥ `{num_part}`",
@@ -556,6 +577,8 @@ async def text_command_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     match_add_boo = re.match(r"^新增噓文數\s+([^\s]+)\s+(\d+)$", text)
     if match_add_boo:
         board_part, num_part = match_add_boo.group(1), match_add_boo.group(2)
+        if not await validate_boards_exist(update, board_part):
+            return
         db.add_subscription(chat_id, "boo", board_part, num_part)
         await update.message.reply_text(
             f"✅ *成功新增噓文數訂閱！*\n📌 看板：`{board_part}`\n👎 門檻：噓文數 ≥ `{num_part}`",
@@ -572,6 +595,8 @@ async def text_command_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text("❌ 文章網址格式不正確！必須為 ptt.cc 文章網址。")
             return
         board, article_id = m.group(1), m.group(2)
+        if not await validate_boards_exist(update, board):
+            return
         details = await fetch_article_details(url)
         ok = db.add_article_tracking(chat_id, url, board, article_id, details["total_comments"])
         if ok:
