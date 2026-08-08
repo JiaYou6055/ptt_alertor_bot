@@ -82,6 +82,7 @@ class TestBotHandlers(unittest.TestCase):
         self.assertEqual(config.NIGHT_CHECK_INTERVAL_SECONDS, 1800)
 
     def test_check_now_handler(self):
+        # check_ptt_job returns >0 -> normal "pushed N articles" reply, no self-test
         update = MagicMock()
         update.message.chat_id = 999
         update.message.text = "立即檢查"
@@ -89,11 +90,30 @@ class TestBotHandlers(unittest.TestCase):
 
         context = MagicMock()
 
-        with patch("bot.check_ptt_job", new=AsyncMock()), patch("bot.check_tracked_articles_job", new=AsyncMock()):
+        with patch("bot.check_ptt_job", new=AsyncMock(return_value=3)), \
+             patch("bot.check_tracked_articles_job", new=AsyncMock()), \
+             patch("bot.resend_latest_matched", new=AsyncMock()) as mock_resend:
             asyncio.run(bot.text_command_handler(update, context))
         self.assertEqual(update.message.reply_text.call_count, 2)
         self.assertIn("正在立即抓取", update.message.reply_text.call_args_list[0][0][0])
-        self.assertIn("立即抓取完成", update.message.reply_text.call_args_list[1][0][0])
+        self.assertIn("已推播 3 篇", update.message.reply_text.call_args_list[1][0][0])
+        mock_resend.assert_not_called()
+
+    def test_check_now_handler_self_test_when_no_new(self):
+        # check_ptt_job returns 0 -> fall back to resend_latest_matched self-test
+        update = MagicMock()
+        update.message.chat_id = 999
+        update.message.text = "立即檢查"
+        update.message.reply_text = AsyncMock()
+
+        context = MagicMock()
+
+        with patch("bot.check_ptt_job", new=AsyncMock(return_value=0)), \
+             patch("bot.check_tracked_articles_job", new=AsyncMock()), \
+             patch("bot.resend_latest_matched", new=AsyncMock(return_value=True)) as mock_resend:
+            asyncio.run(bot.text_command_handler(update, context))
+        mock_resend.assert_called_once()
+        self.assertIn("重送最新一篇", update.message.reply_text.call_args_list[1][0][0])
 
     def _make_article(self, i):
         return {

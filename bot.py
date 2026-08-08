@@ -152,6 +152,62 @@ async def myid_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
 
 
+async def resend_latest_matched(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> bool:
+    """Re-push the single latest board article matching the user's subscriptions.
+
+    Used by /check as a delivery-channel self-test: when a normal crawl found no
+    NEW article to push (everything already pushed), this still sends one real
+    matching article so the user can confirm notifications are working. It bypasses
+    the dedup table on purpose and does NOT mark anything as pushed.
+    Returns True if a test message was sent.
+    """
+    all_subs = db.get_all_subscriptions()
+    my_subs = [s for s in all_subs if s.get("chat_id") == chat_id]
+    if not my_subs:
+        return False
+
+    boards = {s.get("board", "").lower() for s in my_subs if s.get("board")}
+    latest: Optional[Dict[str, Any]] = None
+    latest_ts = -1
+
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+        for board in boards:
+            articles = await fetch_board_articles(board, client=client)
+            board_subs = [s for s in my_subs if s.get("board", "").lower() == board]
+            for article in articles:
+                if not any(match_subscription(article, sub) for sub in board_subs):
+                    continue
+                # Article id looks like "M.<unix_ts>.A.xxx"; use it to find newest.
+                try:
+                    ts = int(article["article_id"].split(".")[1])
+                except (IndexError, ValueError):
+                    ts = 0
+                if ts > latest_ts:
+                    latest_ts = ts
+                    latest = article
+
+    if not latest:
+        return False
+
+    nrec_str = f"[{latest['nrec']}]" if latest["nrec"] else "[0]"
+    msg = (
+        "🧪 *【推播管道測試】* 目前無新文章，重送最新一篇符合條件的文章供您確認推播正常：\n\n"
+        f"🚨 *[{latest['board']}]* {nrec_str} [{latest['title']}]({latest['url']})\n"
+        f"👤 `{latest['author']}` | 📅 {latest['date']}"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=msg,
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Failed to send channel-test message to {chat_id}: {e}")
+        return False
+
+
 async def check_now_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Trigger an immediate crawl cycle without waiting for timer."""
     if not update.message:
@@ -169,10 +225,25 @@ async def check_now_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text("🔄 正在立即抓取最新 PTT 文章與追蹤推文，請稍候...")
 
     # Force execution of jobs
-    await check_ptt_job(context)
+    pushed = await check_ptt_job(context)
     await check_tracked_articles_job(context)
 
-    await update.message.reply_text("✅ 立即抓取完成！若有符合的新文章已推播至您的對話視窗。")
+    if pushed > 0:
+        await update.message.reply_text(
+            f"✅ 立即抓取完成！已推播 {pushed} 篇符合條件的新文章至您的對話視窗。"
+        )
+    else:
+        # No new article to push — send one real matching article as a
+        # delivery-channel self-test so the user can confirm push works.
+        sent = await resend_latest_matched(context, chat_id)
+        if sent:
+            await update.message.reply_text(
+                "✅ 立即抓取完成！目前無新文章，已重送最新一篇符合條件的文章供您確認推播管道正常。"
+            )
+        else:
+            await update.message.reply_text(
+                "✅ 立即抓取完成！目前訂閱看板中沒有任何符合門檻的文章可供推播確認。"
+            )
 
 
 async def night_status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -729,24 +800,28 @@ def build_notification_chunks(matched_list: List[Dict[str, Any]]) -> List[Dict[s
     return chunks
 
 
-async def check_ptt_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Periodic job to fetch PTT articles and match against keyword/author/push/boo subscriptions."""
+async def check_ptt_job(context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Periodic job to fetch PTT articles and match against keyword/author/push/boo subscriptions.
+
+    Returns the number of articles successfully pushed in this cycle (0 if none),
+    so callers like /check can decide whether to run a delivery-channel self-test.
+    """
     global last_ptt_check_time
     now = time.time()
     required_interval = config.get_current_check_interval()
 
     # Dynamic check interval control (300s day / 1800s night)
     if now - last_ptt_check_time < required_interval - 5:
-        return
+        return 0
     last_ptt_check_time = now
 
     boards = db.get_subscribed_boards()
     if not boards:
-        return
+        return 0
 
     all_subs = db.get_all_subscriptions()
     if not all_subs:
-        return
+        return 0
 
     is_night = config.is_night_mode()
 
@@ -780,6 +855,7 @@ async def check_ptt_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Dispatch per user, splitting large batches into multiple messages so a
     # long digest is never rejected by Telegram's 4096-char limit.
+    pushed_count = 0
     for cid, matched_list in user_notifications.items():
         if not matched_list:
             continue
@@ -797,8 +873,11 @@ async def check_ptt_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 # send is retried next cycle instead of being lost forever.
                 for article in chunk["articles"]:
                     db.mark_article_pushed(article["article_id"], article["board"])
+                pushed_count += len(chunk["articles"])
             except Exception as e:
                 logger.error(f"Failed to send alert to {cid}: {e}")
+
+    return pushed_count
 
 
 async def check_tracked_articles_job(context: ContextTypes.DEFAULT_TYPE) -> None:
