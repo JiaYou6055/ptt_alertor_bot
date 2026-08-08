@@ -710,8 +710,9 @@ async def check_ptt_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                             if cid not in user_notifications:
                                 user_notifications[cid] = []
                             user_notifications[cid].append(article)
-
-                    db.mark_article_pushed(article_id, board)
+                    # NOTE: do NOT mark as pushed here. Marking happens only
+                    # after the message is successfully delivered (see below),
+                    # so a failed send does not permanently suppress the alert.
 
     # Dispatch aggregated messages per user to avoid message spam
     for cid, matched_list in user_notifications.items():
@@ -753,6 +754,10 @@ async def check_ptt_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 disable_web_page_preview=False,
                 disable_notification=is_night,
             )
+            # Mark as pushed only after successful delivery so a failed send
+            # can be retried on the next cycle instead of being lost forever.
+            for article in matched_list:
+                db.mark_article_pushed(article["article_id"], article["board"])
         except Exception as e:
             logger.error(f"Failed to send alert to {cid}: {e}")
 

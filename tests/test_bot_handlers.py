@@ -13,12 +13,18 @@ class TestBotHandlers(unittest.TestCase):
             os.remove(self.db_path)
         bot.db = Database(self.db_path)
         bot.db.init_db()
+        # Isolate whitelist config so tests don't depend on the local .env
+        # (ADMIN_USER_ID leaking in would silently block chat_id 999).
+        self._orig_allowed = config.ALLOWED_USER_IDS
+        self._orig_admin = config.ADMIN_USER_ID
         config.ALLOWED_USER_IDS = []
+        config.ADMIN_USER_ID = None
 
     def tearDown(self):
         if os.path.exists(self.db_path):
             os.remove(self.db_path)
-        config.ALLOWED_USER_IDS = []
+        config.ALLOWED_USER_IDS = self._orig_allowed
+        config.ADMIN_USER_ID = self._orig_admin
 
     def test_text_command_add_keyword(self):
         update = MagicMock()
