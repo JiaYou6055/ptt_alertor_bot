@@ -1,0 +1,18 @@
+# 環境變數與敏感資訊 (包含 Telegram Bot Token)
+.env
+
+# SQLite 資料庫檔案
+*.db
+*.db-journal
+
+# Python 快取與虛擬環境
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+
+# 測試與 IDE 設定
+.pytest_cache/
+.vscode/
+.idea/

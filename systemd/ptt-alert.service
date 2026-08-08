@@ -1,0 +1,15 @@
+[Unit]
+Description=PTT Alert Telegram Bot Service
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/ptt-alert
+ExecStart=/home/pi/ptt-alert/venv/bin/python3 /home/pi/ptt-alert/main.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
