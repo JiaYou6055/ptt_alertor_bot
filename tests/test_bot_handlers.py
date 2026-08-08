@@ -75,5 +75,19 @@ class TestBotHandlers(unittest.TestCase):
         self.assertEqual(config.NIGHT_END_HOUR, 7)
         self.assertEqual(config.NIGHT_CHECK_INTERVAL_SECONDS, 1800)
 
+    def test_check_now_handler(self):
+        update = MagicMock()
+        update.message.chat_id = 999
+        update.message.text = "立即檢查"
+        update.message.reply_text = AsyncMock()
+
+        context = MagicMock()
+
+        with patch("bot.check_ptt_job", new=AsyncMock()), patch("bot.check_tracked_articles_job", new=AsyncMock()):
+            asyncio.run(bot.text_command_handler(update, context))
+        self.assertEqual(update.message.reply_text.call_count, 2)
+        self.assertIn("正在立即抓取", update.message.reply_text.call_args_list[0][0][0])
+        self.assertIn("立即抓取完成", update.message.reply_text.call_args_list[1][0][0])
+
 if __name__ == "__main__":
     unittest.main()

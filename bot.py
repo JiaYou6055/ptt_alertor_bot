@@ -98,6 +98,7 @@ async def setup_bot_commands(application) -> None:
     """Register bot command hints in Telegram UI menu."""
     commands = [
         BotCommand("help", "顯示指令對照表與完整說明"),
+        BotCommand("check", "立即執行 PTT 爬蟲抓取 (不用等 5 分鐘)"),
         BotCommand("list", "查看我的 PTT 訂閱清單"),
         BotCommand("top", "查看熱門前 5 名追蹤排行榜"),
         BotCommand("myid", "查詢自己的 Telegram Chat ID"),
@@ -125,6 +126,29 @@ async def myid_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(
             f"🆔 您的 Telegram Chat ID 為：`{chat_id}`{admin_badge}{name_info}", parse_mode="Markdown"
         )
+
+
+async def check_now_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Trigger an immediate crawl cycle without waiting for timer."""
+    if not update.message:
+        return
+
+    chat_id = update.message.chat_id
+    if not is_user_allowed(chat_id):
+        await update.message.reply_text("⛔ 權限不足。")
+        return
+
+    global last_ptt_check_time, last_article_check_time
+    last_ptt_check_time = 0.0
+    last_article_check_time = 0.0
+
+    await update.message.reply_text("🔄 正在立即抓取最新 PTT 文章與追蹤推文，請稍候...")
+
+    # Force execution of jobs
+    await check_ptt_job(context)
+    await check_tracked_articles_job(context)
+
+    await update.message.reply_text("✅ 立即抓取完成！若有符合的新文章已推播至您的對話視窗。")
 
 
 async def night_status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -288,7 +312,8 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• `新增推文 PTT文章網址`\n"
         "  (例如：`新增推文 https://www.ptt.cc/bbs/EZsoft/M.1708247900.A.27C.html`)\n"
         "• `刪除推文 PTT文章網址`\n\n"
-        "📊 *一般查詢*\n"
+        "📊 *一般查詢與操作*\n"
+        "• `立即檢查` (或 `/check`) - 立即觸發抓取 (不用等 5 分鐘)\n"
         "• `清單` (或 `/list`) - 查看我的訂閱項目\n"
         "• `排行` (或 `/top`) - 熱門前五名追蹤排行榜\n"
         "• `/night` - 查看夜間模式狀態\n"
@@ -491,17 +516,22 @@ async def text_command_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await top_handler(update, context)
         return
 
-    # 4. 白名單 / whitelist
+    # 4. 立即檢查 / 立即抓取 / 更新 / check
+    if text in ["立即檢查", "立即抓取", "更新", "check"]:
+        await check_now_handler(update, context)
+        return
+
+    # 5. 白名單 / whitelist
     if text in ["白名單", "whitelist"]:
         await whitelist_handler(update, context)
         return
 
-    # 5. 夜間模式 / night
+    # 6. 夜間模式 / night
     if text in ["夜間模式", "night"]:
         await night_status_handler(update, context)
         return
 
-    # 6. 授權 123456 [備註/姓名] (Admin only)
+    # 7. 授權 123456 [備註/姓名] (Admin only)
     match_allow = re.match(r"^(?:授權|allow)\s+(\d+)(?:\s+(.+))?$", text, re.IGNORECASE)
     if match_allow:
         args = [match_allow.group(1)]
@@ -511,14 +541,14 @@ async def text_command_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await allow_handler(update, context)
         return
 
-    # 7. 取消授權 123456 (Admin only)
+    # 8. 取消授權 123456 (Admin only)
     match_deny = re.match(r"^(?:取消授權|deny)\s+(\d+)$", text, re.IGNORECASE)
     if match_deny:
         context.args = [match_deny.group(1)]
         await deny_handler(update, context)
         return
 
-    # 8. 新增關鍵字: "新增 gossiping,movie 金城武,結衣"
+    # 9. 新增關鍵字: "新增 gossiping,movie 金城武,結衣"
     match_add_kw = re.match(r"^新增\s+([^\s]+)\s+(.+)$", text)
     if match_add_kw:
         board_part, target_part = match_add_kw.group(1), match_add_kw.group(2)
@@ -531,7 +561,7 @@ async def text_command_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    # 9. 刪除關鍵字: "刪除 gossiping 金城武"
+    # 10. 刪除關鍵字: "刪除 gossiping 金城武"
     match_del_kw = re.match(r"^刪除\s+([^\s]+)\s+(.+)$", text)
     if match_del_kw:
         board_part, target_part = match_del_kw.group(1), match_del_kw.group(2)
@@ -539,7 +569,7 @@ async def text_command_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"🗑️ 已刪除 {cnt} 筆關鍵字訂閱 (`{board_part}` - `{target_part}`)。")
         return
 
-    # 10. 新增作者: "新增作者 gossiping ffaarr,obov"
+    # 11. 新增作者: "新增作者 gossiping ffaarr,obov"
     match_add_author = re.match(r"^新增作者\s+([^\s]+)\s+(.+)$", text)
     if match_add_author:
         board_part, target_part = match_add_author.group(1), match_add_author.group(2)
@@ -552,7 +582,7 @@ async def text_command_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    # 11. 刪除作者: "刪除作者 gossiping ffaarr"
+    # 12. 刪除作者: "刪除作者 gossiping ffaarr"
     match_del_author = re.match(r"^刪除作者\s+([^\s]+)\s+(.+)$", text)
     if match_del_author:
         board_part, target_part = match_del_author.group(1), match_del_author.group(2)
@@ -560,7 +590,7 @@ async def text_command_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"🗑️ 已刪除 {cnt} 筆作者訂閱 (`{board_part}` - `{target_part}`)。")
         return
 
-    # 12. 新增推文數: "新增推文數 beauty,joke 10"
+    # 13. 新增推文數: "新增推文數 beauty,joke 10"
     match_add_push = re.match(r"^新增推文數\s+([^\s]+)\s+(\d+)$", text)
     if match_add_push:
         board_part, num_part = match_add_push.group(1), match_add_push.group(2)
@@ -573,7 +603,7 @@ async def text_command_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    # 13. 新增噓文數: "新增噓文數 gossiping 20"
+    # 14. 新增噓文數: "新增噓文數 gossiping 20"
     match_add_boo = re.match(r"^新增噓文數\s+([^\s]+)\s+(\d+)$", text)
     if match_add_boo:
         board_part, num_part = match_add_boo.group(1), match_add_boo.group(2)
@@ -586,7 +616,7 @@ async def text_command_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    # 14. 新增推文 (追蹤文章): "新增推文 https://www.ptt.cc/bbs/EZsoft/M.1708247900.A.27C.html"
+    # 15. 新增推文 (追蹤文章): "新增推文 https://www.ptt.cc/bbs/EZsoft/M.1708247900.A.27C.html"
     match_add_art = re.match(r"^新增推文\s+(https?://[^\s]+)$", text)
     if match_add_art:
         url = match_add_art.group(1)
@@ -608,7 +638,7 @@ async def text_command_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text("ℹ️ 您已經在追蹤此文章了！")
         return
 
-    # 15. 刪除推文 (停止追蹤文章)
+    # 16. 刪除推文 (停止追蹤文章)
     match_del_art = re.match(r"^刪除推文\s+(https?://[^\s]+)$", text)
     if match_del_art:
         url = match_del_art.group(1)
@@ -787,6 +817,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", help_handler))
     application.add_handler(CommandHandler("help", help_handler))
     application.add_handler(CommandHandler("myid", myid_handler))
+    application.add_handler(CommandHandler("check", check_now_handler))
     application.add_handler(CommandHandler("night", night_status_handler))
     application.add_handler(CommandHandler("list", list_handler))
     application.add_handler(CommandHandler("top", top_handler))
