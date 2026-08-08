@@ -20,6 +20,7 @@ from crawler import (
     fetch_article_details,
     match_subscription,
     parse_article_id,
+    parse_nrec_to_int,
     check_board_exists,
 )
 
@@ -38,6 +39,38 @@ last_article_check_time: float = 0.0
 # large batch of matched articles is split into multiple messages instead of
 # being rejected wholesale with "Message is too long".
 TELEGRAM_MAX_MSG_LEN = 3800
+
+# Telegram legacy Markdown (parse_mode="Markdown") special chars that must be
+# escaped when displaying raw, untrusted text (e.g. a PTT title) as plain
+# text rather than as link text, otherwise an unmatched _ * ` [ can break
+# entity parsing and cause the whole message to fail to send.
+_MARKDOWN_V1_SPECIAL_CHARS = re.compile(r"([_*`\[])")
+
+
+def escape_markdown_v1(text: str) -> str:
+    """Escape Telegram legacy Markdown special chars so raw PTT titles render as literal text."""
+    return _MARKDOWN_V1_SPECIAL_CHARS.sub(r"\\\1", text)
+
+
+def format_nrec_display(nrec_raw: str) -> str:
+    """Convert a raw PTT nrec code into a human push/boo label.
+
+    Examples: '66' -> '推66', 'X2' -> '噓20', '爆' -> '推爆', 'XX' -> '噓爆', '' -> '0'.
+    """
+    if not nrec_raw:
+        return "0"
+    if nrec_raw == "爆":
+        return "推爆"
+    if nrec_raw == "XX":
+        return "噓爆"
+    if nrec_raw.startswith("X") and len(nrec_raw) == 2 and nrec_raw[1].isdigit():
+        return f"噓{int(nrec_raw[1]) * 10}"
+    val = parse_nrec_to_int(nrec_raw)
+    if val < 0:
+        return f"噓{abs(val)}"
+    if val == 0:
+        return "0"
+    return f"推{val}"
 
 
 def is_admin(chat_id: int) -> bool:
@@ -169,13 +202,15 @@ async def resend_latest_matched(context: ContextTypes.DEFAULT_TYPE, chat_id: int
     boards = {s.get("board", "").lower() for s in my_subs if s.get("board")}
     latest: Optional[Dict[str, Any]] = None
     latest_ts = -1
+    latest_show_author = False
 
     async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
         for board in boards:
             articles = await fetch_board_articles(board, client=client)
             board_subs = [s for s in my_subs if s.get("board", "").lower() == board]
             for article in articles:
-                if not any(match_subscription(article, sub) for sub in board_subs):
+                matched_subs = [sub for sub in board_subs if match_subscription(article, sub)]
+                if not matched_subs:
                     continue
                 # Article id looks like "M.<unix_ts>.A.xxx"; use it to find newest.
                 try:
@@ -185,16 +220,19 @@ async def resend_latest_matched(context: ContextTypes.DEFAULT_TYPE, chat_id: int
                 if ts > latest_ts:
                     latest_ts = ts
                     latest = article
+                    latest_show_author = any(sub.get("sub_type", "").lower() == "author" for sub in matched_subs)
 
     if not latest:
         return False
 
-    nrec_str = f"[{latest['nrec']}]" if latest["nrec"] else "[0]"
+    nrec_str = f"[{format_nrec_display(latest['nrec'])}]"
     msg = (
         "🧪 *【推播管道測試】* 目前無新文章，重送最新一篇符合條件的文章供您確認推播正常：\n\n"
-        f"🚨 *[{latest['board']}]* {nrec_str} [{latest['title']}]({latest['url']})\n"
-        f"👤 `{latest['author']}` | 📅 {latest['date']}"
+        f"🚨 *[{latest['board']}]* {nrec_str} {escape_markdown_v1(latest['title'])}\n"
+        f"{latest['url']}"
     )
+    if latest_show_author:
+        msg += f"\n👤 `{latest['author']}`"
     try:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -743,11 +781,13 @@ async def text_command_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 def format_article_line(article: Dict[str, Any]) -> str:
-    """Format a single matched article as one compact digest line."""
-    nrec_str = f"[{article['nrec']}]" if article["nrec"] else "[0]"
+    """Format a single matched article as one compact digest line + URL line."""
+    nrec_str = f"[{format_nrec_display(article['nrec'])}]"
+    author_part = f" - `{article['author']}`" if article.get("_show_author") else ""
     return (
         f"• *[{article['board']}]* {nrec_str} "
-        f"[{article['title']}]({article['url']}) - `{article['author']}`"
+        f"{escape_markdown_v1(article['title'])}{author_part}\n"
+        f"  {article['url']}"
     )
 
 
@@ -759,20 +799,24 @@ def build_notification_chunks(matched_list: List[Dict[str, Any]]) -> List[Dict[s
     """
     if len(matched_list) == 1:
         article = matched_list[0]
-        nrec_str = f"[{article['nrec']}]" if article["nrec"] else "[0]"
+        nrec_str = f"[{format_nrec_display(article['nrec'])}]"
+        show_author = article.get("_show_author", False)
         if config.COMPACT_NOTIFICATION:
             text = (
-                f"🚨 *[{article['board']}]* {nrec_str} [{article['title']}]({article['url']})\n"
-                f"👤 `{article['author']}` | 📅 {article['date']}"
+                f"🚨 *[{article['board']}]* {nrec_str} {escape_markdown_v1(article['title'])}\n"
+                f"{article['url']}"
             )
+            if show_author:
+                text += f"\n👤 `{article['author']}`"
         else:
+            author_field = f"👤 *作者：* `{article['author']}`\n" if show_author else ""
             text = (
                 f"🚨 *【PTT Alert】看板：#{article['board']}*\n\n"
-                f"📌 *標題：* {article['title']}\n"
-                f"👤 *作者：* `{article['author']}`\n"
-                f"🔥 *人氣：* {article['nrec'] if article['nrec'] else '0'}\n"
+                f"📌 *標題：* {escape_markdown_v1(article['title'])}\n"
+                f"{author_field}"
+                f"🔥 *人氣：* {format_nrec_display(article['nrec'])}\n"
                 f"📅 *日期：* {article['date']}\n"
-                f"🔗 [點此閱讀文章]({article['url']})"
+                f"🔗 {article['url']}"
             )
         return [{"text": text, "articles": matched_list}]
 
@@ -838,17 +882,19 @@ async def check_ptt_job(context: ContextTypes.DEFAULT_TYPE) -> int:
                 if db.is_article_pushed(article_id):
                     continue
 
-                matched_chat_ids = set()
+                matched_chat_author: Dict[int, bool] = {}
                 for sub in board_subs:
                     if match_subscription(article, sub):
-                        matched_chat_ids.add(sub["chat_id"])
+                        cid = sub["chat_id"]
+                        is_author_match = sub.get("sub_type", "").lower() == "author"
+                        matched_chat_author[cid] = matched_chat_author.get(cid, False) or is_author_match
 
-                if matched_chat_ids:
-                    for cid in matched_chat_ids:
+                if matched_chat_author:
+                    for cid, show_author in matched_chat_author.items():
                         if is_user_allowed(cid):
                             if cid not in user_notifications:
                                 user_notifications[cid] = []
-                            user_notifications[cid].append(article)
+                            user_notifications[cid].append({**article, "_show_author": show_author})
                     # NOTE: do NOT mark as pushed here. Marking happens only
                     # after the message is successfully delivered (see below),
                     # so a failed send does not permanently suppress the alert.
