@@ -95,7 +95,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def setup_bot_commands(application) -> None:
-    """Register bot command hints in Telegram UI menu."""
+    """Register bot command hints in Telegram UI menu and send startup notification."""
     commands = [
         BotCommand("help", "顯示指令對照表與完整說明"),
         BotCommand("check", "立即執行 PTT 爬蟲抓取 (不用等 5 分鐘)"),
@@ -113,6 +113,24 @@ async def setup_bot_commands(application) -> None:
         logger.info("Successfully registered Telegram Bot Commands Menu.")
     except Exception as e:
         logger.error(f"Failed to set bot commands menu: {e}")
+
+    # Send startup online notification to Super Admin
+    if config.ADMIN_USER_ID:
+        try:
+            night_status = "🌙 夜間模式時段中" if config.is_night_mode() else "☀️ 日間正常模式中"
+            startup_msg = (
+                "🟢 *【PTT Alert 機器人上線通知】*\n\n"
+                "🚀 服務已順利啟動運行！\n"
+                f"⏱️ 輪詢間隔：`{config.CHECK_INTERVAL_SECONDS // 60} 分鐘`\n"
+                f"📊 當前模式：`{night_status}`\n\n"
+                "您可以傳送 `指令` 或 `立即檢查` 開始使用。"
+            )
+            await application.bot.send_message(
+                chat_id=config.ADMIN_USER_ID, text=startup_msg, parse_mode="Markdown"
+            )
+            logger.info(f"Sent startup notification to Admin ({config.ADMIN_USER_ID}).")
+        except Exception as e:
+            logger.error(f"Failed to send startup notification: {e}")
 
 
 async def myid_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
