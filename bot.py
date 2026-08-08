@@ -1,6 +1,7 @@
 import logging
 import re
 import time
+from datetime import time as dt_time
 from typing import List, Dict, Any, Optional
 import httpx
 from telegram import Update, BotCommand, User
@@ -859,6 +860,20 @@ async def check_tracked_articles_job(context: ContextTypes.DEFAULT_TYPE) -> None
                     logger.error(f"Failed to send comment notification for {url}: {e}")
 
 
+async def cleanup_pushed_articles_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Daily job to purge pushed_articles older than the retention window.
+
+    Old entries reference articles that have long scrolled off the board index
+    and can never be matched again, so removing them keeps the dedup table small
+    without any risk of re-notifying a stale article.
+    """
+    try:
+        deleted = db.clean_old_pushed_articles(days=7)
+        logger.info(f"🧹 已清理 {deleted} 筆 7 天前的 pushed_articles 去重記錄。")
+    except Exception as e:
+        logger.error(f"Failed to clean old pushed_articles: {e}")
+
+
 def main() -> None:
     """Initialize DB and launch Telegram bot."""
     if not config.TELEGRAM_BOT_TOKEN:
@@ -901,6 +916,10 @@ def main() -> None:
         )
         job_queue.run_repeating(
             check_tracked_articles_job, interval=60, first=10
+        )
+        # Daily cleanup of the dedup table (04:00 local time, during quiet hours)
+        job_queue.run_daily(
+            cleanup_pushed_articles_job, time=dt_time(hour=4, minute=0)
         )
         logger.info("Registered PTT board & article comment check jobs.")
 
