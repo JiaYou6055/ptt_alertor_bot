@@ -16,6 +16,11 @@ HEADERS = {
 }
 COOKIES = {"over18": "1"}
 
+# Consecutive failures required before the circuit breaker trips into cooldown.
+# Below this threshold, failures are logged but crawling retries next cycle,
+# so a single transient network blip does not freeze the bot for 15 minutes.
+FAILURE_THRESHOLD = 3
+
 
 class CircuitBreaker:
     """Circuit breaker for handling PTT network outages and downtime with exponential cooldown."""
@@ -42,13 +47,23 @@ class CircuitBreaker:
 
     def record_failure(self, error_msg: str) -> None:
         self.consecutive_failures += 1
-        # Custom cooldown durations:
-        # 1st failure: 15 mins (900s)
-        # 2nd failure: 30 mins (1800s)
-        # 3rd+ failure: 1 hour (3600s)
-        if self.consecutive_failures == 1:
+        # Only trip the breaker after several consecutive failures so a single
+        # transient network blip (timeout / empty error) does not freeze crawling.
+        # 1st-2nd failure: log only, no cooldown (retry next cycle).
+        # 3rd failure: 15 mins (900s)
+        # 4th failure: 30 mins (1800s)
+        # 5th+ failure: 1 hour (3600s)
+        if self.consecutive_failures < FAILURE_THRESHOLD:
+            logger.warning(
+                f"⚠️ PTT 連線失敗 ({error_msg})。連續失敗次數: {self.consecutive_failures}"
+                f"/{FAILURE_THRESHOLD}，尚未達熔斷門檻，下一輪將重試。"
+            )
+            return
+
+        over = self.consecutive_failures - FAILURE_THRESHOLD
+        if over == 0:
             cooldown_sec = 15 * 60
-        elif self.consecutive_failures == 2:
+        elif over == 1:
             cooldown_sec = 30 * 60
         else:
             cooldown_sec = 60 * 60

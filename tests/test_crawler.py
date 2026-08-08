@@ -41,10 +41,20 @@ class TestCrawler(unittest.TestCase):
     def test_circuit_breaker_cooldown(self):
         self.assertFalse(circuit_breaker.is_in_cooldown())
 
-        # 1st failure -> 15 mins (900s) cooldown
+        # Failures below FAILURE_THRESHOLD (3) only count, no cooldown yet,
+        # so a single transient blip does not freeze crawling.
+        circuit_breaker.record_failure("HTTP 503")
+        self.assertFalse(circuit_breaker.is_in_cooldown())
+        self.assertEqual(circuit_breaker.consecutive_failures, 1)
+
+        circuit_breaker.record_failure("HTTP 503")
+        self.assertFalse(circuit_breaker.is_in_cooldown())
+        self.assertEqual(circuit_breaker.consecutive_failures, 2)
+
+        # 3rd consecutive failure trips the breaker -> 15 min cooldown
         circuit_breaker.record_failure("HTTP 503")
         self.assertTrue(circuit_breaker.is_in_cooldown())
-        self.assertEqual(circuit_breaker.consecutive_failures, 1)
+        self.assertEqual(circuit_breaker.consecutive_failures, 3)
 
         # Success resets circuit breaker
         circuit_breaker.record_success()
