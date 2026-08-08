@@ -80,6 +80,19 @@ def update_user_info_from_telegram(user: Optional[User]) -> str:
     return display_name
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log uncaught errors and send a notification to Super Admin if configured."""
+    logger.error("Exception while handling an update:", exc_info=context.error)
+    if config.ADMIN_USER_ID:
+        try:
+            err_msg = f"⚠️ *【系統異常通知】*\n`{str(context.error)[:250]}`"
+            await context.bot.send_message(
+                chat_id=config.ADMIN_USER_ID, text=err_msg, parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"Failed to send error notification to Admin: {e}")
+
+
 async def setup_bot_commands(application) -> None:
     """Register bot command hints in Telegram UI menu."""
     commands = [
@@ -478,7 +491,7 @@ async def text_command_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if match_allow:
         args = [match_allow.group(1)]
         if match_allow.group(2):
-            args.append(match_add_kw.group(2) if 'match_add_kw' in locals() else match_allow.group(2))
+            args.append(match_allow.group(2))
         context.args = args
         await allow_handler(update, context)
         return
@@ -600,6 +613,9 @@ async def check_ptt_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     is_night = config.is_night_mode()
 
+    # Map chat_id -> List of matched articles for batching
+    user_notifications: Dict[int, List[Dict[str, Any]]] = {}
+
     async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
         for board in boards:
             articles = await fetch_board_articles(board, client=client)
@@ -616,35 +632,56 @@ async def check_ptt_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                         matched_chat_ids.add(sub["chat_id"])
 
                 if matched_chat_ids:
-                    nrec_str = f"[{article['nrec']}]" if article['nrec'] else "[0]"
-                    if config.COMPACT_NOTIFICATION:
-                        msg = (
-                            f"🚨 *[{article['board']}]* {nrec_str} [{article['title']}]({article['url']})\n"
-                            f"👤 `{article['author']}` | 📅 {article['date']}"
-                        )
-                    else:
-                        msg = (
-                            f"🚨 *【PTT Alert】看板：#{article['board']}*\n\n"
-                            f"📌 *標題：* {article['title']}\n"
-                            f"👤 *作者：* `{article['author']}`\n"
-                            f"🔥 *人氣：* {article['nrec'] if article['nrec'] else '0'}\n"
-                            f"📅 *日期：* {article['date']}\n"
-                            f"🔗 [點此閱讀文章]({article['url']})"
-                        )
                     for cid in matched_chat_ids:
                         if is_user_allowed(cid):
-                            try:
-                                await context.bot.send_message(
-                                    chat_id=cid,
-                                    text=msg,
-                                    parse_mode="Markdown",
-                                    disable_web_page_preview=False,
-                                    disable_notification=is_night,
-                                )
-                            except Exception as e:
-                                logger.error(f"Failed to send alert to {cid}: {e}")
+                            if cid not in user_notifications:
+                                user_notifications[cid] = []
+                            user_notifications[cid].append(article)
 
                     db.mark_article_pushed(article_id, board)
+
+    # Dispatch aggregated messages per user to avoid message spam
+    for cid, matched_list in user_notifications.items():
+        if not matched_list:
+            continue
+
+        if len(matched_list) == 1:
+            article = matched_list[0]
+            nrec_str = f"[{article['nrec']}]" if article['nrec'] else "[0]"
+            if config.COMPACT_NOTIFICATION:
+                msg = (
+                    f"🚨 *[{article['board']}]* {nrec_str} [{article['title']}]({article['url']})\n"
+                    f"👤 `{article['author']}` | 📅 {article['date']}"
+                )
+            else:
+                msg = (
+                    f"🚨 *【PTT Alert】看板：#{article['board']}*\n\n"
+                    f"📌 *標題：* {article['title']}\n"
+                    f"👤 *作者：* `{article['author']}`\n"
+                    f"🔥 *人氣：* {article['nrec'] if article['nrec'] else '0'}\n"
+                    f"📅 *日期：* {article['date']}\n"
+                    f"🔗 [點此閱讀文章]({article['url']})"
+                )
+        else:
+            # Combine multiple articles into a single digest summary message
+            lines = [f"🚨 *【PTT 訂閱通知】包含 {len(matched_list)} 篇新文章：*\n"]
+            for article in matched_list:
+                nrec_str = f"[{article['nrec']}]" if article['nrec'] else "[0]"
+                lines.append(
+                    f"• *[{article['board']}]* {nrec_str} [{article['title']}]({article['url']}) - `{article['author']}`"
+                )
+            msg = "\n".join(lines)
+
+        try:
+            await context.bot.send_message(
+                chat_id=cid,
+                text=msg,
+                parse_mode="Markdown",
+                disable_web_page_preview=False,
+                disable_notification=is_night,
+            )
+        except Exception as e:
+            logger.error(f"Failed to send alert to {cid}: {e}")
 
 
 async def check_tracked_articles_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -717,6 +754,9 @@ def main() -> None:
     logger.info("Database initialized successfully.")
 
     application = ApplicationBuilder().post_init(setup_bot_commands).token(config.TELEGRAM_BOT_TOKEN).build()
+
+    # Register uncaught exception error handler
+    application.add_error_handler(error_handler)
 
     # Slash command handlers
     application.add_handler(CommandHandler("start", help_handler))
