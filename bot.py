@@ -157,10 +157,11 @@ async def setup_bot_commands(application) -> None:
     if config.ADMIN_USER_ID:
         try:
             night_status = "🌙 夜間模式時段中" if config.is_night_mode() else "☀️ 日間正常模式中"
+            current_interval_min = config.get_current_check_interval() // 60
             startup_msg = (
                 "🟢 *【PTT Alert 機器人上線通知】*\n\n"
                 "🚀 服務已順利啟動運行！\n"
-                f"⏱️ 輪詢間隔：`{config.CHECK_INTERVAL_SECONDS // 60} 分鐘`\n"
+                f"⏱️ 輪詢間隔：`{current_interval_min} 分鐘`\n"
                 f"📊 當前模式：`{night_status}`\n\n"
                 "您可以傳送 `指令` 或 `立即檢查` 開始使用。"
             )
