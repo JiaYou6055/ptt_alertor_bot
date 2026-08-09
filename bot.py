@@ -22,6 +22,7 @@ from crawler import (
     parse_article_id,
     parse_nrec_to_int,
     check_board_exists,
+    is_article_too_old,
 )
 
 logging.basicConfig(
@@ -881,6 +882,8 @@ async def check_ptt_job(context: ContextTypes.DEFAULT_TYPE) -> int:
             for article in articles:
                 article_id = article["article_id"]
                 if db.is_article_pushed(article_id):
+                    continue
+                if is_article_too_old(article_id):
                     continue
 
                 matched_chat_author: Dict[int, bool] = {}

@@ -21,6 +21,12 @@ COOKIES = {"over18": "1"}
 # so a single transient network blip does not freeze the bot for 15 minutes.
 FAILURE_THRESHOLD = 3
 
+# Articles older than this are never pushed. Low-traffic boards can keep an
+# article sitting in the crawled index pages for a long time; without this
+# cutoff a stale article could still cross a push/boo threshold or newly
+# match a keyword long after it was actually posted.
+MAX_ARTICLE_AGE_DAYS = 7
+
 
 class CircuitBreaker:
     """Circuit breaker for handling PTT network outages and downtime with exponential cooldown."""
@@ -84,6 +90,26 @@ def parse_article_id(href: str) -> str:
     if match:
         return match.group(1)
     return href.split("/")[-1].replace(".html", "")
+
+
+def extract_article_timestamp(article_id: str) -> int:
+    """Extract the embedded unix timestamp from a PTT article_id like 'M.1700000001.A.100'."""
+    try:
+        return int(article_id.split(".")[1])
+    except (IndexError, ValueError):
+        return 0
+
+
+def is_article_too_old(article_id: str, max_age_days: int = MAX_ARTICLE_AGE_DAYS) -> bool:
+    """Check whether an article's post timestamp is older than max_age_days.
+
+    Returns False (not too old) when the timestamp can't be determined, so
+    unparsable IDs are never silently dropped from matching.
+    """
+    ts = extract_article_timestamp(article_id)
+    if ts <= 0:
+        return False
+    return (time.time() - ts) > max_age_days * 86400
 
 
 def parse_nrec_to_int(nrec: str) -> int:

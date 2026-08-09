@@ -6,6 +6,7 @@ from crawler import (
     parse_nrec_to_int,
     match_subscription,
     circuit_breaker,
+    is_article_too_old,
 )
 
 SAMPLE_HTML = """
@@ -65,6 +66,16 @@ class TestCrawler(unittest.TestCase):
         self.assertEqual(parse_nrec_to_int("爆"), 100)
         self.assertEqual(parse_nrec_to_int("10"), 10)
         self.assertEqual(parse_nrec_to_int("X2"), -20)
+
+    def test_is_article_too_old(self):
+        recent_id = f"M.{int(time.time()) - 3600}.A.100"  # 1 hour ago
+        old_id = f"M.{int(time.time()) - 8 * 86400}.A.100"  # 8 days ago
+        within_boundary_id = f"M.{int(time.time()) - 7 * 86400 + 60}.A.100"  # just under 7 days ago
+        self.assertFalse(is_article_too_old(recent_id))
+        self.assertTrue(is_article_too_old(old_id))
+        self.assertFalse(is_article_too_old(within_boundary_id))
+        # Unparsable id must not be dropped from matching
+        self.assertFalse(is_article_too_old("not-a-valid-id"))
 
     def test_parse_board_html_with_prev_url(self):
         articles, prev_url = parse_board_html(SAMPLE_HTML, "Stock")
