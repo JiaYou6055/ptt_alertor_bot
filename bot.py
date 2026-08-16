@@ -1,6 +1,7 @@
 import logging
 import re
 import time
+import traceback
 from datetime import time as dt_time
 from typing import List, Dict, Any, Optional
 import httpx
@@ -35,6 +36,7 @@ db = Database(config.DB_PATH)
 # Last execution timestamps for dynamic night interval control
 last_ptt_check_time: float = 0.0
 last_article_check_time: float = 0.0
+last_error_notify_time: Dict[int, float] = {}
 
 # Telegram hard limit per message is 4096 chars; keep a safety buffer so a
 # large batch of matched articles is split into multiple messages instead of
@@ -122,16 +124,44 @@ def update_user_info_from_telegram(user: Optional[User]) -> str:
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log uncaught errors and send a notification to Super Admin if configured."""
+    """Log uncaught errors to DB and send notification to Super Admin if configured."""
     logger.error("Exception while handling an update:", exc_info=context.error)
+
+    err_type = type(context.error).__name__ if context.error else "UnknownError"
+    err_msg_str = str(context.error) if context.error else "No error message"
+    tb_lines = (
+        traceback.format_exception(None, context.error, context.error.__traceback__)
+        if context.error
+        else []
+    )
+    tb_str = "".join(tb_lines)
+
+    log_res = db.log_system_error(err_type, err_msg_str, tb_str)
+    err_id = log_res["id"]
+    count = log_res["occurrence_count"]
+    is_new = log_res["is_new"]
+
     if config.ADMIN_USER_ID:
-        try:
-            err_msg = f"⚠️ *【系統異常通知】*\n`{str(context.error)[:250]}`"
-            await context.bot.send_message(
-                chat_id=config.ADMIN_USER_ID, text=err_msg, parse_mode="Markdown"
-            )
-        except Exception as e:
-            logger.error(f"Failed to send error notification to Admin: {e}")
+        now = time.time()
+        last_sent = last_error_notify_time.get(err_id, 0.0)
+        # Notify Admin if it's a new error OR > 10 min (600s) since last notification
+        if is_new or (now - last_sent > 600):
+            last_error_notify_time[err_id] = now
+            try:
+                safe_err = escape_markdown_v1(err_msg_str[:200])
+                safe_type = escape_markdown_v1(err_type)
+                msg = (
+                    f"⚠️ *【系統異常通知】*\n"
+                    f"📌 *ID:* `{err_id}` | *類型:* `{safe_type}` | *累計次數:* {count}\n"
+                    f"💬 *訊息:* `{safe_err}`\n\n"
+                    f"💡 可使用 `/err_detail {err_id}` 查看完整資訊，或 `/err_resolve {err_id}` 標記已處理。"
+                )
+                await context.bot.send_message(
+                    chat_id=config.ADMIN_USER_ID, text=msg, parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(f"Failed to send error notification to Admin: {e}")
+
 
 
 async def setup_bot_commands(application) -> None:
@@ -147,6 +177,9 @@ async def setup_bot_commands(application) -> None:
         BotCommand("allow", "【管理員】授權 Chat ID (如 /allow 123 小明)"),
         BotCommand("deny", "【管理員】取消某 Chat ID 的授權"),
         BotCommand("whitelist", "【管理員】查看授權白名單列表與成員名稱"),
+        BotCommand("errors", "【管理員】查看未解決的系統異常清單"),
+        BotCommand("err_detail", "【管理員】查看指定異常 ID 詳細資訊與 Traceback"),
+        BotCommand("err_resolve", "【管理員】將指定異常 ID 標記為已處理"),
     ]
     try:
         await application.bot.set_my_commands(commands)
@@ -413,6 +446,93 @@ async def whitelist_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         lines.append("超級管理員可使用 `/allow <ID> [備註/姓名]` 管理白名單！")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def list_errors_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """【管理員】查看未解決的系統異常記錄清單 (/errors)"""
+    if not update.effective_chat or not update.message:
+        return
+    chat_id = update.effective_chat.id
+    if config.ADMIN_USER_ID and chat_id != config.ADMIN_USER_ID:
+        await update.message.reply_text("⛔ 您沒有權限使用此管理員指令。")
+        return
+
+    errors = db.get_pending_errors(limit=10)
+    if not errors:
+        await update.message.reply_text("✅ 目前沒有待處理的系統異常記錄！", parse_mode="Markdown")
+        return
+
+    lines = ["🛠️ *【未解決系統異常清單】* (最多前 10 筆)\n"]
+    for err in errors:
+        eid = err["id"]
+        etype = escape_markdown_v1(err["error_type"])
+        emsg = escape_markdown_v1(err["message"][:60])
+        cnt = err["occurrence_count"]
+        last = err["last_seen"] or err["first_seen"] or "未知"
+        lines.append(f"• *ID `{eid}`* | `{etype}` (共 {cnt} 次)\n  `{emsg}`\n  ⏱️ 最後發生: {last}\n")
+
+    lines.append("\n💡 提示：使用 `/err_detail <ID>` 查看詳細 Traceback，`/err_resolve <ID>` 標記已修復。")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def error_detail_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """【管理員】查看特定異常詳細資訊 (/err_detail <ID>)"""
+    if not update.effective_chat or not update.message:
+        return
+    chat_id = update.effective_chat.id
+    if config.ADMIN_USER_ID and chat_id != config.ADMIN_USER_ID:
+        await update.message.reply_text("⛔ 您沒有權限使用此管理員指令。")
+        return
+
+    args = context.args or []
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("⚠️ 請提供正確的異常 ID，範例：`/err_detail 1`", parse_mode="Markdown")
+        return
+
+    err_id = int(args[0])
+    err = db.get_error_by_id(err_id)
+    if not err:
+        await update.message.reply_text(f"❌ 找不到 ID 為 `{err_id}` 的異常記錄。", parse_mode="Markdown")
+        return
+
+    etype = escape_markdown_v1(err["error_type"])
+    emsg = escape_markdown_v1(err["message"])
+    tb = err["traceback"][:1500] if err["traceback"] else "無 Traceback 紀錄"
+    status = "🔴 待處理 (pending)" if err["status"] == "pending" else "🟢 已解決 (resolved)"
+
+    msg = (
+        f"🔍 *【異常詳細紀錄 ID: {err['id']}】*\n\n"
+        f"📌 *狀態:* {status}\n"
+        f"🏷️ *類型:* `{etype}`\n"
+        f"🔢 *累計次數:* {err['occurrence_count']}\n"
+        f"🕒 *首次發生:* {err['first_seen']}\n"
+        f"⏱️ *最後發生:* {err['last_seen']}\n\n"
+        f"💬 *錯誤訊息:* `{emsg}`\n\n"
+        f"📜 *Traceback (前 1500 字元):*\n```\n{tb}\n```"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def resolve_error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """【管理員】標記異常為已解決 (/err_resolve <ID>)"""
+    if not update.effective_chat or not update.message:
+        return
+    chat_id = update.effective_chat.id
+    if config.ADMIN_USER_ID and chat_id != config.ADMIN_USER_ID:
+        await update.message.reply_text("⛔ 您沒有權限使用此管理員指令。")
+        return
+
+    args = context.args or []
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("⚠️ 請提供正確的異常 ID，範例：`/err_resolve 1`", parse_mode="Markdown")
+        return
+
+    err_id = int(args[0])
+    ok = db.resolve_error(err_id)
+    if ok:
+        await update.message.reply_text(f"✅ 已成功將異常 ID `{err_id}` 標記為已解決！", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"❌ 標記失敗，找不到 ID 為 `{err_id}` 的異常記錄。", parse_mode="Markdown")
 
 
 async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1030,6 +1150,9 @@ def main() -> None:
     application.add_handler(CommandHandler("allow", allow_handler))
     application.add_handler(CommandHandler("deny", deny_handler))
     application.add_handler(CommandHandler("whitelist", whitelist_handler))
+    application.add_handler(CommandHandler("errors", list_errors_handler))
+    application.add_handler(CommandHandler("err_detail", error_detail_handler))
+    application.add_handler(CommandHandler("err_resolve", resolve_error_handler))
 
     # Text message parser for natural Chinese Ptt-Alertor commands
     application.add_handler(

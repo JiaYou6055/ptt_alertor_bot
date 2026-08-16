@@ -82,5 +82,22 @@ class TestCrawler(unittest.TestCase):
         self.assertEqual(len(articles), 1)
         self.assertEqual(prev_url, "https://www.ptt.cc/bbs/Stock/index100.html")
 
+    def test_get_with_retry_recovers(self):
+        import asyncio
+        import httpx
+        from unittest.mock import AsyncMock, MagicMock
+        from crawler import get_with_retry
+
+        client = MagicMock()
+        ok_response = MagicMock(status_code=200)
+        # First call fails with ReadError, second succeeds
+        client.get = AsyncMock(side_effect=[httpx.ReadError("Connection reset"), ok_response])
+
+        res = asyncio.run(get_with_retry(client, "https://www.ptt.cc/bbs/Stock/index.html", max_retries=2, delay=0.01))
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(client.get.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
+

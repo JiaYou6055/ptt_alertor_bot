@@ -54,6 +54,19 @@ class Database:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+            # System errors table for error tracking & deduplication
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS system_errors (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    error_type TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    traceback TEXT NOT NULL,
+                    occurrence_count INTEGER DEFAULT 1,
+                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    status TEXT DEFAULT 'pending'
+                );
+            """)
             # Migration check: add name column if missing from older DB
             cursor.execute("PRAGMA table_info(allowed_users);")
             columns = [row["name"] for row in cursor.fetchall()]
@@ -297,3 +310,91 @@ class Database:
             )
             conn.commit()
             return cursor.rowcount
+
+    def log_system_error(
+        self, error_type: str, message: str, traceback_str: str = ""
+    ) -> Dict[str, Any]:
+        """Record or aggregate a system error. Returns dict with error id, count, and status."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT id, occurrence_count, last_seen 
+                FROM system_errors 
+                WHERE error_type = ? AND message = ? AND status = 'pending'
+                ORDER BY last_seen DESC LIMIT 1
+                """,
+                (error_type, message),
+            )
+            row = cursor.fetchone()
+            if row:
+                err_id = row["id"]
+                new_count = row["occurrence_count"] + 1
+                cursor.execute(
+                    """
+                    UPDATE system_errors 
+                    SET occurrence_count = ?, last_seen = CURRENT_TIMESTAMP, traceback = ?
+                    WHERE id = ?
+                    """,
+                    (new_count, traceback_str, err_id),
+                )
+                conn.commit()
+                return {
+                    "id": err_id,
+                    "occurrence_count": new_count,
+                    "is_new": False,
+                    "last_seen": row["last_seen"],
+                }
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO system_errors (error_type, message, traceback)
+                    VALUES (?, ?, ?)
+                    """,
+                    (error_type, message, traceback_str),
+                )
+                err_id = cursor.lastrowid
+                conn.commit()
+                return {
+                    "id": err_id,
+                    "occurrence_count": 1,
+                    "is_new": True,
+                    "last_seen": None,
+                }
+
+    def get_pending_errors(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Fetch pending system errors ordered by last_seen desc."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT id, error_type, message, occurrence_count, first_seen, last_seen, status
+                FROM system_errors
+                WHERE status = 'pending'
+                ORDER BY last_seen DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_error_by_id(self, error_id: int) -> Optional[Dict[str, Any]]:
+        """Fetch a specific system error by ID."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM system_errors WHERE id = ?", (error_id,)
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def resolve_error(self, error_id: int) -> bool:
+        """Mark a system error as resolved."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE system_errors SET status = 'resolved' WHERE id = ?", (error_id,)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+

@@ -1,3 +1,4 @@
+import asyncio
 import re
 import time
 import logging
@@ -15,6 +16,28 @@ HEADERS = {
     )
 }
 COOKIES = {"over18": "1"}
+
+
+async def get_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: Optional[Dict[str, str]] = None,
+    cookies: Optional[Dict[str, str]] = None,
+    max_retries: int = 2,
+    delay: float = 1.5,
+) -> httpx.Response:
+    """Perform HTTP GET request with automatic retry on transient network transport errors."""
+    for attempt in range(max_retries + 1):
+        try:
+            return await client.get(url, headers=headers, cookies=cookies)
+        except (httpx.TransportError, httpx.HTTPStatusError) as e:
+            if attempt == max_retries:
+                raise e
+            logger.info(
+                f"⚠️ 連線傳輸異常 ({type(e).__name__})，將於 {delay} 秒後進行第 {attempt + 1}/{max_retries} 次自動重試..."
+            )
+            await asyncio.sleep(delay)
+
 
 # Consecutive failures required before the circuit breaker trips into cooldown.
 # Below this threshold, failures are logged but crawling retries next cycle,
@@ -202,7 +225,7 @@ async def fetch_board_articles(
         for _ in range(pages):
             if not current_url:
                 break
-            response = await client.get(current_url, headers=HEADERS, cookies=COOKIES)
+            response = await get_with_retry(client, current_url, headers=HEADERS, cookies=COOKIES)
             if response.status_code != 200:
                 circuit_breaker.record_failure(f"HTTP {response.status_code}")
                 return all_articles
@@ -239,7 +262,7 @@ async def fetch_article_details(
         should_close = True
 
     try:
-        response = await client.get(article_url, headers=HEADERS, cookies=COOKIES)
+        response = await get_with_retry(client, article_url, headers=HEADERS, cookies=COOKIES)
         if response.status_code != 200:
             circuit_breaker.record_failure(f"HTTP {response.status_code}")
             return {"title": "", "comments": [], "total_comments": 0}
@@ -315,7 +338,7 @@ async def check_board_exists(board: str, client: Optional[httpx.AsyncClient] = N
         client = httpx.AsyncClient(timeout=5.0, follow_redirects=True)
         should_close = True
     try:
-        response = await client.get(url, headers=HEADERS, cookies=COOKIES)
+        response = await get_with_retry(client, url, headers=HEADERS, cookies=COOKIES)
         return response.status_code == 200
     except Exception:
         return False

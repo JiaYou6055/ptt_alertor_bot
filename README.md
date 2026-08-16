@@ -163,6 +163,9 @@ PTT Alert Bot starting polling...
 - `授權 <Chat_ID> [備註/姓名]` (或 `/allow <ID> [備註/姓名]`)：動態授權 Chat ID 並可附帶備註姓名（免重啟，如 `授權 123456789 小明`）
 - `取消授權 <Chat_ID>` (或 `/deny <ID>`)：動態撤銷某 Chat ID 的存取權限（免重啟）
 - `白名單` (或 `/whitelist`)：查看目前所有獲授權的 Chat ID 列表與自動紀錄的人名網名
+- `/errors`：【管理員】查看未解決的系統異常清單與發生次數
+- `/err_detail <ID>`：【管理員】查看指定 ID 異常的完整訊息與 Traceback
+- `/err_resolve <ID>`：【管理員】將指定 ID 異常標記為已處理 (resolved)
 
 ---
 

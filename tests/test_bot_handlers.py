@@ -144,5 +144,64 @@ class TestBotHandlers(unittest.TestCase):
         self.assertEqual(total, 100)
 
 
+    def test_error_handler_logging_and_admin_notify(self):
+        config.ADMIN_USER_ID = 111
+        bot.last_error_notify_time.clear()
+
+        context = MagicMock()
+        context.error = ValueError("Test system exception")
+        context.bot.send_message = AsyncMock()
+
+        asyncio.run(bot.error_handler(None, context))
+
+        # Check error was logged in DB
+        pending = bot.db.get_pending_errors()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["error_type"], "ValueError")
+        self.assertIn("Test system exception", pending[0]["message"])
+
+        # Check Admin received Telegram notification
+        context.bot.send_message.assert_called_once()
+        sent_msg = context.bot.send_message.call_args[1]["text"]
+        self.assertIn("【系統異常通知】", sent_msg)
+        self.assertIn("ValueError", sent_msg)
+
+    def test_admin_error_commands(self):
+        config.ADMIN_USER_ID = 111
+
+        # 1. Insert a test error into DB
+        res = bot.db.log_system_error("RuntimeError", "Sample failure", "Traceback details...")
+        err_id = res["id"]
+
+        # 2. Test list_errors_handler (/errors)
+        update = MagicMock()
+        update.effective_chat.id = 111
+        update.message.reply_text = AsyncMock()
+        context = MagicMock()
+
+        asyncio.run(bot.list_errors_handler(update, context))
+        update.message.reply_text.assert_called_once()
+        self.assertIn("【未解決系統異常清單】", update.message.reply_text.call_args[0][0])
+        self.assertIn("RuntimeError", update.message.reply_text.call_args[0][0])
+
+        # 3. Test error_detail_handler (/err_detail 1)
+        update.message.reply_text.reset_mock()
+        context.args = [str(err_id)]
+        asyncio.run(bot.error_detail_handler(update, context))
+        self.assertIn("【異常詳細紀錄 ID:", update.message.reply_text.call_args[0][0])
+        self.assertIn("Traceback details...", update.message.reply_text.call_args[0][0])
+
+        # 4. Test resolve_error_handler (/err_resolve 1)
+        update.message.reply_text.reset_mock()
+        context.args = [str(err_id)]
+        asyncio.run(bot.resolve_error_handler(update, context))
+        self.assertIn("已成功將異常 ID", update.message.reply_text.call_args[0][0])
+
+        # Verify DB status is resolved
+        pending_after = bot.db.get_pending_errors()
+        self.assertEqual(len(pending_after), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
+
